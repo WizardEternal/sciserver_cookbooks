@@ -75,7 +75,6 @@ from itertools import islice
 from IPython.display import display
 
 import pandas as pd
-import tempfile
 
 # Configure logging for errors
 logging.basicConfig(
