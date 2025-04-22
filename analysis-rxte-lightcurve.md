@@ -258,6 +258,7 @@ def align_and_concatenate_lcurves(lcurves):
 
 lcurve = align_and_concatenate_lcurves(lcurves)
 
+plt.figure(figsize=(10, 6))
 plt.plot(lcurve['TIME'], lcurve['RATE'])
 plt.show()
 ```
@@ -340,7 +341,6 @@ for i, val in enumerate(results[:nlimit]):
         lc = rxte_lc(obsid=val['obsid'], ao=val['cycle'], chmin=5, chmax=10, cleanup=True)
         if lc is not None:
             lcurves.append(lc)  # Store only non-None lightcurves
-            plt.plot(lc['TIME'], lc['RATE'])  # Plot each individual lightcurve
     except Exception as e:
         logging.error(f"Failed to extract lightcurve for ObsID {val['obsid']}: {e}")
         print(f"Failed to extract lightcurve for ObsID {val['obsid']}: {e}")
@@ -382,7 +382,7 @@ Before running the function in parallel, we construct a list `pars` that holds t
 
 ```python
 nlimit = 64
-ncpu = min(mp.cpu_count()) 
+ncpu = mp.cpu_count()
 total_obs = len(list(islice(results, nlimit)))  # Total number of observations to be processed
 manager = mp.Manager()
 progress = manager.Value('i', 0)  # Shared counter to track progress
