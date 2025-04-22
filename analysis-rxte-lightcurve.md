@@ -62,14 +62,37 @@ from astropy.io import fits
 from astropy.coordinates import SkyCoord
 import matplotlib.pyplot as plt
 import datetime
-
-# tqdm is needed to show progress
-from tqdm import tqdm
+import logging
 
 import heasoftpy as hsp
 
 # for prallelization
 import multiprocessing as mp
+
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from itertools import islice
+from IPython.display import display
+
+import pandas as pd
+import tempfile
+
+# Configure logging for errors
+logging.basicConfig(
+    filename='rxte_lightcurve.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+def simple_progress_bar(total, current, bar_length=30):
+    """Custom progress bar to avoid tqdm overhead."""
+    percent = current / total
+    filled_length = int(bar_length * percent)
+    bar = '█' * filled_length + '-' * (bar_length - filled_length)
+    print(f'\r[{bar}] {percent*100:.2f}% ({current}/{total})', end='\r')
+
+# 🗄️ Set up Temp Directory in Memory
+os.environ['TMPDIR'] = '/dev/shm'
 ```
 
 ## 3. Find the Data
@@ -113,18 +136,23 @@ For more example on how to use these powerful VO services, see the [Data Access]
 ```python
 # Get the coordinate for Eta Car
 pos = SkyCoord.from_name("eta car")
-query="""SELECT target_name, cycle, prnb, obsid, time, exposure, ra, dec 
-    FROM public.xtemaster as cat 
-    where 
-    contains(point('ICRS',cat.ra,cat.dec),circle('ICRS',{},{},0.1))=1 
-    and 
-    cat.exposure > 0 order by cat.time
-    """.format(pos.ra.deg, pos.dec.deg)
+query = f"""
+SELECT target_name, cycle, prnb, obsid, time, exposure, ra, dec, 
+    sqrt(power(cat.ra - {pos.ra.deg}, 2) + power(cat.dec - {pos.dec.deg}, 2)) * 3600 as offset_arcsec
+FROM public.xtemaster as cat 
+WHERE 
+    contains(point('ICRS', cat.ra, cat.dec), circle('ICRS', {pos.ra.deg}, {pos.dec.deg}, 0.1)) = 1 
+    AND cat.exposure > 0 
+ORDER BY cat.time
+"""
 ```
 
 ```python
 results=tap_services[0].search(query).to_table()
-results
+
+# Show full results in a DataFrame
+results_df = results.to_pandas()
+display(results_df)
 ```
 
 Let's just see how long these observations are:
@@ -140,56 +168,101 @@ plt.ylabel('Exposure (s)')
 Let's collect all the standard product light curves for RXTE.  (These are described on the [RXTE analysis pages](https://heasarc.gsfc.nasa.gov/docs/xte/recipes/cook_book.html).)
 
 ```python
-## Need cycle number as well, since after AO9, 
-##  no longer 1st digit of proposal number
-ids = np.unique( results['cycle','prnb','obsid','time'])
-ids.sort(order='time')
-ids
-```
-
-```python
 ## Construct a file list.
+
+def check_file_exists(path):
+    """Check if file exists in a multi-threaded pool."""
+    return path if os.path.exists(path) else None
+
 rxtedata = "/FTP/rxte/data/archive"
-filenames = []
-for (k,val) in enumerate(tqdm(ids['obsid'], total=len(ids))):
-    fname = "{}/AO{}/P{}/{}/stdprod/xp{}_n2a.lc.gz".format(
-        rxtedata,
-        ids['cycle'][k],
-        ids['prnb'][k],
-        ids['obsid'][k],
-        ids['obsid'][k].replace('-',''))
-    
-    # keep only files that exist
-    if os.path.exists(fname):
-        filenames.append(fname)
-print("Found {} out of {} files".format(len(filenames), len(ids)))
+filenames = [
+    f"{rxtedata}/AO{cycle}/P{prnb}/{obsid}/stdprod/xp{obsid.replace('-', '')}_n2a.lc.gz"
+    for cycle, prnb, obsid in zip(results['cycle'], results['prnb'], results['obsid'])
+]
+
+# Check in parallel for missing files
+total_files = len(filenames)
+valid_files = []
+
+with ThreadPoolExecutor(max_workers=16) as executor:
+    for i, file in enumerate(executor.map(check_file_exists, filenames)):
+        if file: 
+            valid_files.append(file)
+        simple_progress_bar(total_files, i + 1)  # Update progress bar
+
+filenames = [file for file in valid_files if file]
+print(f"\nFound {len(filenames)} files out of {len(results)} observations.")
 ```
 
 Let's collect them all into one light curve:
 
 ```python
 lcurves = []
-for file in tqdm(filenames):
-    with fits.open(file) as hdul:
-        data = hdul[1].data
-        lcurves.append(data)
-    plt.plot(data['TIME'], data['RATE'])
+def load_and_plot_fits_file(file, i, total_files):
+    """Load a FITS file and return its lightcurve data."""
+    try:
+        with fits.open(file) as hdul:
+            data = hdul[1].data  # Extract lightcurve data from the second header
+        simple_progress_bar(total_files, i + 1)  # Update progress bar
+        return data  # Return the lightcurve data
+    except Exception as e:
+        logging.error(f"Failed to load file {file}: {e}")
+        return None
+
+total_files = len(filenames)
+
+with ThreadPoolExecutor(max_workers=16) as executor:
+    futures = {executor.submit(load_and_plot_fits_file, file, i, total_files): file for i, file in enumerate(filenames)}
+    for i, future in enumerate(futures):
+        simple_progress_bar(total_files, i + 1)  # Update progress bar
+        result = future.result()
+        if result is not None:
+            lcurves.append(result)
+
+plt.figure(figsize=(10, 6))
+for i, data in enumerate(lcurves):
+    plt.plot(data['TIME'], data['RATE'], alpha=0.6)  # Plot each lightcurve with slight transparency
+plt.show()
 ```
 
 ```python
 # combine the ligh curves into one
-lcurve = np.hstack(lcurves)
+def align_and_concatenate_lcurves(lcurves):
+    """Align fields in all lightcurves and concatenate them."""
+    # Find the union of all field names in the lightcurves
+    all_fields = set()
+    for lc in lcurves:
+        all_fields.update(lc.dtype.names)
+    
+    all_fields = sorted(all_fields)
 
-# The above LCs are merged per proposal.  You can see that some proposals
-# had data added later, after other proposals, so you need to sort:
-lcurve.sort(order='TIME')
+    aligned_lcurves = []
+    for i, lc in enumerate(lcurves):
+        current_fields = lc.dtype.names  # Fields present in the current lightcurve
+        new_dtype = [(field, lc.dtype[field]) if field in current_fields else (field, 'f8') for field in all_fields]
+        
+        # Create an empty structured array with the new dtype
+        new_lc = np.zeros(lc.shape, dtype=new_dtype)
+        
+        for field in lc.dtype.names:
+            new_lc[field] = lc[field]
+        
+        aligned_lcurves.append(new_lc)
 
-# plot the light curve
+    concatenated_lcurve = np.concatenate(aligned_lcurves)
+
+    # The above LCs are merged per proposal.  You can see that some proposals
+    # had data added later, after other proposals, so you need to sort:
+    concatenated_lcurve.sort(order='TIME') 
+    return concatenated_lcurve
+
+lcurve = align_and_concatenate_lcurves(lcurves)
+
 plt.plot(lcurve['TIME'], lcurve['RATE'])
-
+plt.show()
 ```
 
-## 4. Re-extract the Light Curve
+## 5. Re-extract the Light Curve
 
 Let's say we find that we need different channel boundaries than were used in the standard products.  We can write a function that does the RXTE data analysis steps for every observation to extract a lightcurve and read it into memory to recreate the above dataset.  This function may look complicated, but it only calls three RXTE executables:
 
@@ -207,64 +280,47 @@ class XlcError(Exception):
 
 
 #  Define a function that, given an ObsID, does the rxte light curve extraction
-def rxte_lc(obsid=None, ao=None , chmin=None, chmax=None, cleanup=True):
-    rxtedata = "/FTP/rxte/data/archive"
-    obsdir = "{}/AO{}/P{}/{}/".format(
-        rxtedata,
-        ao,
-        obsid[0:5],
-        obsid
-    )
-    outdir = f"tmp.{obsid}"
-    if (not os.path.isdir(outdir)):
-        os.mkdir(outdir)
-
-    if cleanup and os.path.isdir(outdir):
-        shutil.rmtree(outdir, ignore_errors=True)
-
-    result = hsp.pcaprepobsid(indir=obsdir, outdir=outdir)
-    if result.returncode != 0:
-        raise XlcError(f"pcaprepobsid returned status {result.returncode}.\n{result.stdout}")
-
-    # Recommended filter from RTE Cookbook pages:
-    filt_expr = "(ELV > 4) && (OFFSET < 0.1) && (NUM_PCU_ON > 0) && .NOT. ISNULL(ELV) && (NUM_PCU_ON < 6)"
+def rxte_lc(obsid, ao, chmin=5, chmax=10, cleanup=True):
+    """Extract RXTE lightcurve for a given ObsID."""
+    import tempfile  # Re-import here for multiprocessing
+    outdir = tempfile.mkdtemp(prefix=f"tmp.{obsid}.")
+    obsdir = f"/FTP/rxte/data/archive/AO{ao}/P{obsid[:5]}/{obsid}/"
     try:
-        filt_file = glob.glob(outdir+"/FP_*.xfl")[0]
-    except:
-        raise XlcError("pcaprepobsid doesn't seem to have made a filter file!")
+        result = hsp.pcaprepobsid(indir=obsdir, outdir=outdir)
+        
+        filt_files = glob.glob(f"{outdir}/FP_*.xfl")
+        if not filt_files:
+            available_files = glob.glob(f"{outdir}/*")
+            logging.error(f"No FP_*.xfl file found for ObsID {obsid} in {outdir}. Available files: {available_files}")
+            raise XlcError(f"Failed to find FP_*.xfl for ObsID {obsid}")
+        
+        filt_file = filt_files[0]
 
-    result = hsp.maketime(
-        infile=filt_file, 
-        outfile=os.path.join(outdir,'rxte_example.gti'),
-        expr=filt_expr, name='NAME', 
-        value='VALUE', 
-        time='TIME', 
-        compact='NO'
-    )
-    if result.returncode != 0:
-        raise XlcError(f"maketime returned status {result.returncode}.\n{result.stdout}")
-      
-    # Running pcaextlc2
-    result = hsp.pcaextlc2(
-        src_infile="@{}/FP_dtstd2.lis".format(outdir),
-        bkg_infile="@{}/FP_dtbkg2.lis".format(outdir),
-        outfile=os.path.join(outdir,'rxte_example.lc'), 
-        gtiandfile=os.path.join(outdir,'rxte_example.gti'),
-        chmin=chmin,
-        chmax=chmax,
-        pculist='ALL', layerlist='ALL', binsz=16
-    )
+        result = hsp.maketime(infile=filt_file, outfile=os.path.join(outdir, 'rxte_example.gti'), 
+                              expr="(ELV > 4) && (OFFSET < 0.1)", name='NAME', value='VALUE', time='TIME', compact='NO')
 
-    if result.returncode != 0:
-        raise XlcError(f"pcaextlc2 returned status {result.returncode}.\n{result.stdout}")
+        result = hsp.pcaextlc2(src_infile=f"@{outdir}/FP_dtstd2.lis", bkg_infile=f"@{outdir}/FP_dtbkg2.lis", 
+                               outfile=os.path.join(outdir, 'rxte_example.lc'), 
+                               gtiandfile=os.path.join(outdir, 'rxte_example.gti'), 
+                               chmin=chmin, chmax=chmax, pculist='ALL', layerlist='ALL', binsz=16)
 
-    with fits.open(os.path.join(outdir,'rxte_example.lc')) as hdul:
-        lc = hdul[1].data
-    
-    if cleanup:
-        shutil.rmtree(outdir,ignore_errors=True)
-    
-    return lc
+        lc_path = os.path.join(outdir, 'rxte_example.lc')
+
+        if not os.path.exists(lc_path):
+            logging.error(f"Lightcurve file {lc_path} not found for ObsID {obsid}")
+            raise FileNotFoundError(f"rxte_example.lc not found for ObsID {obsid} in {outdir}")
+
+        with fits.open(lc_path) as hdul:
+            lc = hdul[1].data
+
+        return lc
+
+    except Exception as e:
+        logging.error(f"Error processing ObsID {obsid}: {e}")
+        return None  # Return None if an error occurs
+
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
 
 ```
 
@@ -275,14 +331,22 @@ Our new light curves will be for channels 5-10
 ```python
 # For this tutorial, we limit the number of observations to 10
 nlimit = 10
+total_obs = len(results[:nlimit])
+
 lcurves = []
-for (k,val) in tqdm(enumerate(ids[:nlimit])):
-    lc = rxte_lc(obsid=val['obsid'], ao=val['cycle'], chmin="5", chmax="10", cleanup=True)
-    lcurves.append(lc)
-lcurve = np.hstack(lcurves)
+for i, val in enumerate(results[:nlimit]):
+    simple_progress_bar(total_obs, i + 1)  # Update progress bar for observation load
+    try:
+        lc = rxte_lc(obsid=val['obsid'], ao=val['cycle'], chmin=5, chmax=10, cleanup=True)
+        if lc is not None:
+            lcurves.append(lc)  # Store only non-None lightcurves
+            plt.plot(lc['TIME'], lc['RATE'])  # Plot each individual lightcurve
+    except Exception as e:
+        logging.error(f"Failed to extract lightcurve for ObsID {val['obsid']}: {e}")
+        print(f"Failed to extract lightcurve for ObsID {val['obsid']}: {e}")
 ```
 
-## 5. Running the Extraction in Parallel.
+## 6. Running the Extraction in Parallel.
 As noted, extracting the light curves for all observations will take a while if run in serial. We will look next into parallizing the `rxte_lc` calls. We will use the `multiprocessing` python module.
 
 We do this by first creating a wrapper around `rxte_lc` that does a few things:
@@ -295,20 +359,17 @@ We will use all CPUs available in the machine. This can be changing the value of
 
 ```python
 def rxte_lc_wrapper(pars):
-    """A wrapper around rxte_lc so it can be called in parallel
-
-    pars: (obsid, ao, chmin, chmax, cleanup)
-    
-    """
-    obsid, ao, chmin, chmax, cleanup = pars
-    
-    # the following is needed so the parameter files
-    # in parallel calls do not read or write the same file
-    with hsp.utils.local_pfiles_context():
-        try:
-            lc = rxte_lc(obsid, ao, chmin, chmax, cleanup)
-        except XlcError:
-            lc = None
+    """Wrapper for RXTE lightcurve extraction to be used in multiprocessing."""
+    obsid, ao, chmin, chmax, cleanup, progress, lock = pars  # Added progress and lock
+    try:
+        lc = rxte_lc(obsid, ao, chmin, chmax, cleanup)
+    except Exception as e:
+        logging.error(f"Error in rxte_lc_wrapper for ObsID {obsid}: {e}")
+        print(f"Error in rxte_lc_wrapper for ObsID {obsid}: {e}")
+        lc = None  # Return None to continue processing
+    finally:
+        with lock:  # Use a shared lock to ensure thread-safe progress update
+            progress.value += 1  # Safely increment the shared counter
     return lc
 ```
 
@@ -321,34 +382,49 @@ Before running the function in parallel, we construct a list `pars` that holds t
 
 ```python
 nlimit = 64
-ncpu = mp.cpu_count()
-pars = []
-for (k,val) in enumerate(ids[:nlimit]):
-    pars.append([val['obsid'], val['cycle'], "5", "10", True])
+ncpu = min(mp.cpu_count()) 
+total_obs = len(list(islice(results, nlimit)))  # Total number of observations to be processed
+manager = mp.Manager()
+progress = manager.Value('i', 0)  # Shared counter to track progress
+lock = manager.Lock()  # Lock for thread-safe updates to progress
 
+# Generate parameters for pool
+pars = [[val['obsid'], val['cycle'], 5, 10, True, progress, lock] for val in islice(results, nlimit)]  # Pass progress & lock
+
+#  Use imap_unordered to get results as they complete
+lcs = []  # Store all successfully extracted lightcurves
 with mp.Pool(processes=ncpu) as pool:
-    lcs = pool.map(rxte_lc_wrapper, pars)
+    for lc in pool.imap_unordered(rxte_lc_wrapper, pars):  # Using imap_unordered for early results
+        if lc is not None:
+            lcs.append(lc)  # Only store non-None lightcurves
+        
+        # Progress bar for shared progress tracking
+        simple_progress_bar(total_obs, progress.value)  # Update the progress bar
 ```
 
 ```python
-# combine the ligh curves into one
-lcurve = np.hstack(lcs)
+# combine the ligh curves into one while removing None values
+lcs = [lc for lc in lcs if lc is not None]
 
-# The above LCs are merged per proposal.  You can see that some proposals
-# had data added later, after other proposals, so you need to sort:
-lcurve.sort(order='TIME')
+if lcs:
+    lcurve = align_and_concatenate_lcurves(lcs)  # Align and combine all lightcurves into one
+else:
+    logging.error("No lightcurves to combine.")
+    lcurve = None
 
-# plot the light curve
-plt.figure(figsize=(8,4))
-plt.plot(lcurve['TIME'], lcurve['RATE'])
-plt.xlabel('Time (s)')
-plt.ylabel('Rate ($s^{-1}$)')
+# Plot Final Lightcurve
+if lcurve is not None:
+    plt.figure(figsize=(8, 4))
+    plt.plot(lcurve['TIME'], lcurve['RATE'])
+    plt.xlabel('Time (s)')
+    plt.ylabel('Rate ($s^{-1}$)')
+    plt.title('Combined Lightcurve from All Files')
+    plt.show()
+else:
+    logging.error("No lightcurve to plot.")
 ```
 
 With the parallelization, we can do more observations at a fraction of the time.
 
 If you want run this notebook on all observations, you can comment out the two cell that runs in serial (the cell below where `rxte_lc` is defined), and submit this notebook in the [batch queue](https://apps.sciserver.org/compute/jobs) on Sciserver.
 
-```python
-
-```
